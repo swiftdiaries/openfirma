@@ -55,14 +55,10 @@ const VZ_GUEST_COMMAND_PTY_VSOCK_PORT: u32 = 18081;
 const VZ_GUEST_COMMAND_PTY_CONTROL_VSOCK_PORT: u32 = 18082;
 const VZ_GUEST_BROKER_VSOCK_PORT: u32 = 18083;
 
-/// Directory a `sandbox-exec` workload may connect unix sockets into.
+/// The only directory a network-deny workload may connect unix sockets into.
 ///
-/// Network-deny mode blocks every other unix-socket connect, so a workload that
-/// runs its own socket-connected helpers (a micro-VM tool sandbox, for one)
-/// binds them here. The path derives only from the sandbox id, never from the
-/// launch environment, so profile `env_set` cannot widen the allowance. It sits
-/// under `/private/tmp` rather than the runtime dir because socket names under
-/// the runtime dir overrun the 104-byte `sun_path` limit.
+/// Derived from the sandbox id alone, so `env_set` cannot widen it. Lives under
+/// `/private/tmp` because runtime-dir socket paths overrun `sun_path`.
 struct VzSocketDir {
     path: PathBuf,
 }
@@ -82,10 +78,6 @@ impl VzSocketDir {
         &self.path
     }
 
-    /// Creates the directory, refusing one that already exists.
-    ///
-    /// `/private/tmp` is shared, so adopting a pre-existing entry would let its
-    /// owner read or plant sockets the workload trusts.
     fn create(&self) -> Result<(), RunError> {
         firma_fs::create_new_private_dir(&self.path).map_err(|error| RunError::Backend {
             backend: BackendKind::Vz.to_string(),
@@ -103,7 +95,6 @@ impl VzSocketDir {
     }
 }
 
-/// Whether `mode` launches the workload through `sandbox-exec` on the host.
 const fn uses_sandbox_exec(mode: VzStructuralMode) -> bool {
     match mode {
         VzStructuralMode::Compatibility | VzStructuralMode::SandboxExecNetworkDeny => true,
@@ -376,8 +367,7 @@ impl SandboxBackend for VzBackend {
         command.arg(&launch.executable).args(&launch.args);
         command.current_dir(&launch.cwd);
         command.envs(&launch.env);
-        // Set after the profile env so a configured value cannot point the
-        // workload at a directory the sandbox profile does not allow.
+        // After the profile env, so config cannot override it.
         command.env(VZ_SOCKET_DIR_ENV, socket_dir.path());
 
         let claude_profile = launch
@@ -1487,11 +1477,9 @@ fn build_sandbox_profile(
              (deny network-outbound)\n",
         );
         profile.push_str(&loopback_allow_rules(launch));
-        // A broader allowance, such as every `/private/tmp/*.sock`, would let
-        // the workload connect to a VM tool sandbox started outside Firma, whose
-        // host-side listener forwards guest traffic around the proxy. Seatbelt
-        // matches the resolved path, so a symlink planted in the directory
-        // cannot redirect a connect elsewhere.
+        // Never broaden to a shared pattern like `/private/tmp/*.sock`: that
+        // reaches sockets of VMs started outside Firma, whose host-side
+        // listeners forward traffic around the proxy.
         let escaped = escape_sandbox_path(&socket_dir.path().display().to_string());
         let _ = writeln!(
             profile,
@@ -2481,8 +2469,7 @@ mod tests {
 
     #[test]
     fn socket_dir_leaves_room_for_long_socket_names() {
-        // macOS `sun_path` holds 104 bytes including the trailing NUL. Gondolin's
-        // longest per-VM socket name is the longest consumer name known today.
+        // macOS `sun_path` is 104 bytes including the NUL.
         const LONGEST_KNOWN_SOCKET_NAME: &str = "gondolin-virtio-ingress-00000000.sock";
         let socket_dir = VzSocketDir::for_sandbox(&SandboxId::generate());
         let socket = socket_dir.path().join(LONGEST_KNOWN_SOCKET_NAME);
@@ -2538,14 +2525,11 @@ mod tests {
         }
     }
 
-    /// Runs the generated profile under the real `sandbox-exec`. Needs a host
-    /// that is not itself inside a Seatbelt sandbox, because `sandbox-exec`
-    /// does not nest.
+    /// Fails when run inside another Seatbelt sandbox; `sandbox-exec` does not nest.
     #[cfg(target_os = "macos")]
     #[test]
     fn network_deny_profile_limits_unix_connects_to_the_socket_dir() {
-        // Under `/private/tmp`, not `$TMPDIR`: the per-user temp dir is long
-        // enough to overrun `sun_path`, and Seatbelt matches resolved paths.
+        // `$TMPDIR` paths overrun `sun_path`.
         let root = tempfile::tempdir_in(VZ_SOCKET_DIR_PARENT).expect("tempdir");
         let socket_dir = VzSocketDir::in_dir(root.path(), &SandboxId::generate());
         socket_dir.create().expect("create socket dir");
