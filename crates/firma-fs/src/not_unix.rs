@@ -17,6 +17,13 @@ pub fn create_private_dir_all(path: &Path) -> Result<(), CreatePrivateDirError> 
     })
 }
 
+pub fn create_new_private_dir(path: &Path) -> Result<(), CreatePrivateDirError> {
+    std::fs::create_dir(path).map_err(|e| CreatePrivateDirError::Create {
+        path: path.to_path_buf(),
+        source: e,
+    })
+}
+
 pub fn write_file(path: &Path, bytes: &[u8], _mode: u32) -> Result<(), FsError> {
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).truncate(true).write(true);

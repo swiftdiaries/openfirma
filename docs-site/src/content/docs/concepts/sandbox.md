@@ -163,6 +163,8 @@ Available modes:
 | Interactive CLI/TUI support | **Yes / experimental.** Still host-process based through `sandbox-exec`. |
 | Evidence status | Runtime code and unit tests exist; macOS hardware E2E assertions are written but not yet green evidence. |
 
+Unix-domain socket connects are denied except into one private directory per run, `/private/tmp/firma-<sandbox-id>`. Firma creates it owner-only before launch, refuses to start if the path already exists, exports it as `FIRMA_RUN_SOCKET_DIR`, and removes it on teardown. Workloads that run socket-connected helpers, such as a micro-VM tool sandbox, must bind those sockets there. A socket anywhere else, including one owned by a process outside the run, stays unreachable. `FIRMA_RUN_SOCKET_DIR` is also set in the default compatibility mode, where unix sockets are not restricted.
+
 #### `vz` + `FIRMA_RUN_VZ_GUEST=1`
 
 | Runtime invariant | Status |

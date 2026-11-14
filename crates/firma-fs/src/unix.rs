@@ -37,6 +37,24 @@ pub fn create_private_dir_all(path: &Path) -> Result<(), CreatePrivateDirError> 
     Ok(())
 }
 
+pub fn create_new_private_dir(path: &Path) -> Result<(), CreatePrivateDirError> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(false).mode(0o700);
+    builder
+        .create(path)
+        .map_err(|e| CreatePrivateDirError::Create {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        CreatePrivateDirError::Chmod {
+            path: path.to_path_buf(),
+            source: e,
+        }
+    })?;
+    Ok(())
+}
+
 pub fn write_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), FsError> {
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).truncate(true).write(true).mode(mode);
