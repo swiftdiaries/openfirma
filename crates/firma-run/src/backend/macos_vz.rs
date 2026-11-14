@@ -2523,6 +2523,9 @@ mod tests {
                 let error = std::fs::rename(from, &to).expect_err("rename into the socket dir");
                 assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied, "{from}");
             }
+            let error = std::fs::hard_link(&probe.outside, socket_dir.join("linked.sock"))
+                .expect_err("hard link into the socket dir");
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         }
     }
 
