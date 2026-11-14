@@ -52,6 +52,7 @@ wait-timeout.workspace = true
 libc = { workspace = true }
 
 [dev-dependencies]
+camino = { workspace = true, features = ["serde1"] }
 chrono.workspace = true
 firma-core.workspace = true
 firma-http.workspace = true

@@ -2095,6 +2095,7 @@ name = "firma-run"
 version = "0.2.0-rc4"
 dependencies = [
  "anyhow",
+ "camino",
  "chrono",
  "ctrlc",
  "dialoguer",

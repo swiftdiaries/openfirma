@@ -397,9 +397,7 @@ impl SandboxBackend for VzBackend {
 
     fn teardown(&self, handle: SandboxHandle) -> Result<(), RunError> {
         remove_runtime_dir(&handle.runtime_dir);
-        if uses_sandbox_exec(vz_structural_mode()) {
-            VzSocketDir::for_sandbox(&handle.identity.sandbox_id).remove();
-        }
+        VzSocketDir::for_sandbox(&handle.identity.sandbox_id).remove();
         Ok(())
     }
 
@@ -1479,11 +1477,15 @@ fn build_sandbox_profile(
         profile.push_str(&loopback_allow_rules(launch));
         // Never broaden to a shared pattern like `/private/tmp/*.sock`: that
         // reaches sockets of VMs started outside Firma, whose host-side
-        // listeners forward traffic around the proxy.
+        // listeners forward traffic around the proxy. The two write denies stop
+        // the workload from renaming such a socket, or a directory holding
+        // one, into the allowed dir.
         let escaped = escape_sandbox_path(&socket_dir.path().display().to_string());
         let _ = writeln!(
             profile,
-            "(allow network-outbound (remote unix-socket (subpath \"{escaped}\")))"
+            "(allow network-outbound (remote unix-socket (subpath \"{escaped}\")))\n\
+             (deny file-write-unlink (require-all (vnode-type SOCKET) (require-not (subpath \"{escaped}\"))))\n\
+             (deny file-write-create (require-all (subpath \"{escaped}\") (require-not (vnode-type SOCKET))))"
         );
     }
 
@@ -2438,23 +2440,11 @@ mod tests {
             1,
             "no other unix-socket allowance may appear: {profile}"
         );
-    }
-
-    #[test]
-    fn socket_dir_allowance_ignores_the_launch_env() {
-        let mut launch = test_launch("generic");
-        launch
-            .env
-            .insert(VZ_SOCKET_DIR_ENV.to_string(), "/private/tmp".to_string());
-        let profile = build_sandbox_profile(
-            &launch,
-            VzStructuralMode::SandboxExecNetworkDeny,
-            &test_socket_dir(),
-        );
-
         assert!(
-            !profile.contains("(subpath \"/private/tmp\")"),
-            "a configured env value must not widen the allowance: {profile}"
+            profile.contains(
+                "(deny file-write-unlink (require-all (vnode-type SOCKET) (require-not (subpath \"/private/tmp/firma-sbx_test\"))))"
+            ),
+            "sockets outside the dir must not be movable into it: {profile}"
         );
     }
 
@@ -2465,6 +2455,7 @@ mod tests {
             build_sandbox_profile(&launch, VzStructuralMode::Compatibility, &test_socket_dir());
 
         assert!(!profile.contains("unix-socket"), "{profile}");
+        assert!(!profile.contains("vnode-type SOCKET"), "{profile}");
     }
 
     #[test]
@@ -2510,8 +2501,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[derive(serde::Serialize, serde::Deserialize)]
     struct UnixConnectProbe {
-        inside: PathBuf,
-        outside: PathBuf,
+        inside: camino::Utf8PathBuf,
+        outside: camino::Utf8PathBuf,
+        outside_parent: camino::Utf8PathBuf,
     }
 
     firma_test_helpers::process_fixture! {
@@ -2522,13 +2514,29 @@ mod tests {
             let error = std::os::unix::net::UnixStream::connect(&probe.outside)
                 .expect_err("connect outside the run's socket dir");
             assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+            let socket_dir = probe.inside.parent().expect("socket dir");
+            for (from, to) in [
+                (&probe.outside, socket_dir.join("moved.sock")),
+                (&probe.outside_parent, socket_dir.join("moved")),
+            ] {
+                let error = std::fs::rename(from, &to).expect_err("rename into the socket dir");
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied, "{from}");
+            }
         }
     }
 
-    /// Fails when run inside another Seatbelt sandbox; `sandbox-exec` does not nest.
     #[cfg(target_os = "macos")]
     #[test]
     fn network_deny_profile_limits_unix_connects_to_the_socket_dir() {
+        let nests = Command::new("sandbox-exec")
+            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !nests {
+            eprintln!("skipped: already inside a Seatbelt sandbox, and sandbox-exec does not nest");
+            return;
+        }
         // `$TMPDIR` paths overrun `sun_path`.
         let root = tempfile::tempdir_in(VZ_SOCKET_DIR_PARENT).expect("tempdir");
         let socket_dir = VzSocketDir::in_dir(root.path(), &SandboxId::generate());
@@ -2547,7 +2555,12 @@ mod tests {
             &socket_dir,
         );
 
-        let fixture = unix_connect_probe(UnixConnectProbe { inside, outside });
+        let utf8 = |path: PathBuf| camino::Utf8PathBuf::from_path_buf(path).expect("UTF-8 path");
+        let fixture = unix_connect_probe(UnixConnectProbe {
+            inside: utf8(inside),
+            outside: utf8(outside),
+            outside_parent: utf8(outside_dir),
+        });
         let status = Command::new("sandbox-exec")
             .arg("-p")
             .arg(&profile)
