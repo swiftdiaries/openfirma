@@ -4,6 +4,8 @@
 //!
 //! - [`create_private_dir_all`] creates a directory tree and, on Unix, ensures
 //!   the final directory ends with private permissions.
+//! - [`create_new_private_dir`] is the create-once variant of
+//!   [`create_private_dir_all`].
 //! - [`write_private_file`] writes a file that must always end with private
 //!   permissions on Unix.
 //! - [`write_file`] writes a file whose final Unix mode is chosen by the
@@ -35,7 +37,7 @@ use not_unix as platform;
 #[cfg(unix)]
 use unix as platform;
 
-/// Error returned by [`create_private_dir_all`].
+/// Error returned by [`create_private_dir_all`] and [`create_new_private_dir`].
 #[derive(Debug, thiserror::Error)]
 pub enum CreatePrivateDirError {
     /// Directory creation failed.
@@ -110,6 +112,20 @@ pub fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
 /// or [`CreatePrivateDirError::Chmod`] if its permissions cannot be set to 0700.
 pub fn create_private_dir_all(path: &Path) -> Result<(), CreatePrivateDirError> {
     platform::create_private_dir_all(path)
+}
+
+/// Create the single directory `path` with mode 0700 on Unix.
+///
+/// Fails if anything, including a symlink, already exists at `path`, so a
+/// directory planted in a shared parent is never adopted. On non-Unix
+/// platforms, falls back to [`std::fs::create_dir`].
+///
+/// # Errors
+///
+/// Returns [`CreatePrivateDirError::Create`] if the directory cannot be created,
+/// or [`CreatePrivateDirError::Chmod`] if its mode cannot be set to 0700.
+pub fn create_new_private_dir(path: &Path) -> Result<(), CreatePrivateDirError> {
+    platform::create_new_private_dir(path)
 }
 
 /// Write `bytes` to `path`, creating or truncating it, with the given Unix

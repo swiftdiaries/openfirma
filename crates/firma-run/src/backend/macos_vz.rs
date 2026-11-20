@@ -17,6 +17,7 @@ use crate::backend::{
 use crate::config::{MountSpec, NetworkPolicy, SidecarEndpoint};
 use crate::env::ExecutionEnv;
 use crate::error::RunError;
+use firma_identifiers::SandboxId;
 use sha2::{Digest as _, Sha256};
 
 const VZ_GUEST_MODE_ENV: &str = "FIRMA_RUN_VZ_GUEST";
@@ -26,6 +27,8 @@ const VZ_GUEST_KERNEL_ENV: &str = "FIRMA_RUN_VZ_GUEST_KERNEL";
 const VZ_GUEST_INITRD_ENV: &str = "FIRMA_RUN_VZ_GUEST_INITRD";
 const VZ_GUEST_ROOTFS_ENV: &str = "FIRMA_RUN_VZ_GUEST_ROOTFS";
 const VZ_GUEST_LAUNCH_CONTRACT_VERSION: u32 = 2;
+const VZ_SOCKET_DIR_ENV: &str = "FIRMA_RUN_SOCKET_DIR";
+const VZ_SOCKET_DIR_PARENT: &str = "/private/tmp";
 const VZ_GUEST_FORBIDDEN_COMMAND_ENV_KEYS: &[&str] = &[
     "FIRMA_CAPABILITY_TOKEN",
     "FIRMA_SECRET_BROKER_ADDR",
@@ -51,6 +54,53 @@ const VZ_GUEST_SIDECAR_VSOCK_PORT: u32 = 18080;
 const VZ_GUEST_COMMAND_PTY_VSOCK_PORT: u32 = 18081;
 const VZ_GUEST_COMMAND_PTY_CONTROL_VSOCK_PORT: u32 = 18082;
 const VZ_GUEST_BROKER_VSOCK_PORT: u32 = 18083;
+
+/// The only directory a network-deny workload may connect unix sockets into.
+///
+/// Derived from the sandbox id alone, so `env_set` cannot widen it. Lives under
+/// `/private/tmp` because runtime-dir socket paths overrun `sun_path`.
+struct VzSocketDir {
+    path: PathBuf,
+}
+
+impl VzSocketDir {
+    fn for_sandbox(sandbox_id: &SandboxId) -> Self {
+        Self::in_dir(Path::new(VZ_SOCKET_DIR_PARENT), sandbox_id)
+    }
+
+    fn in_dir(parent: &Path, sandbox_id: &SandboxId) -> Self {
+        Self {
+            path: parent.join(format!("firma-{sandbox_id}")),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn create(&self) -> Result<(), RunError> {
+        firma_fs::create_new_private_dir(&self.path).map_err(|error| RunError::Backend {
+            backend: BackendKind::Vz.to_string(),
+            reason: format!(
+                "failed to create private socket dir {}: {error}; sandbox ids are \
+                 unique per run, so an existing entry was created by another process. \
+                 Inspect and remove it before retrying",
+                self.path.display()
+            ),
+        })
+    }
+
+    fn remove(&self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+const fn uses_sandbox_exec(mode: VzStructuralMode) -> bool {
+    match mode {
+        VzStructuralMode::Compatibility | VzStructuralMode::SandboxExecNetworkDeny => true,
+        VzStructuralMode::VzGuest => false,
+    }
+}
 
 /// Host paths owned by the VZ guest-launch handoff.
 struct VzGuestLayout {
@@ -207,6 +257,12 @@ impl SandboxBackend for VzBackend {
                 .into_root();
 
         create_vz_runtime_dir(&runtime_dir)?;
+        if uses_sandbox_exec(vz_structural_mode())
+            && let Err(error) = VzSocketDir::for_sandbox(&request.identity.sandbox_id).create()
+        {
+            remove_runtime_dir(&runtime_dir);
+            return Err(error);
+        }
 
         let mounts = request
             .profile
@@ -305,11 +361,14 @@ impl SandboxBackend for VzBackend {
 
         let mut command = Command::new("sandbox-exec");
 
-        let profile = build_sandbox_profile(launch, mode);
+        let socket_dir = VzSocketDir::for_sandbox(&handle.identity.sandbox_id);
+        let profile = build_sandbox_profile(launch, mode, &socket_dir);
         command.arg("-p").arg(&profile);
         command.arg(&launch.executable).args(&launch.args);
         command.current_dir(&launch.cwd);
         command.envs(&launch.env);
+        // After the profile env, so config cannot override it.
+        command.env(VZ_SOCKET_DIR_ENV, socket_dir.path());
 
         let claude_profile = launch
             .env
@@ -338,6 +397,7 @@ impl SandboxBackend for VzBackend {
 
     fn teardown(&self, handle: SandboxHandle) -> Result<(), RunError> {
         remove_runtime_dir(&handle.runtime_dir);
+        VzSocketDir::for_sandbox(&handle.identity.sandbox_id).remove();
         Ok(())
     }
 
@@ -1380,13 +1440,18 @@ fn ensure_executable_file(name: &str, path: &Path) {
 /// In `SandboxExecNetworkDeny` mode the profile adds `deny network-outbound`
 /// after the default `allow`, then re-allows loopback **only to Firma's own
 /// endpoints** — the proxy bridge (`HTTP_PROXY`) and DNS stub
-/// (`FIRMA_DNS_STUB_ADDR`). All external IP connections are denied by
+/// (`FIRMA_DNS_STUB_ADDR`) — and unix-socket connects only into the run's
+/// [`VzSocketDir`]. All external IP connections are denied by
 /// `TrustedBSD` MAC at the socket layer — including raw sockets, direct
-/// TCP/UDP, Unix-domain socket connects, and UDP-based DNS to external
+/// TCP/UDP, other Unix-domain socket connects, and UDP-based DNS to external
 /// resolvers — and so are other host loopback services (admin ports, daemons,
 /// MCP servers). See [`loopback_allow_rules`] for the port-scoping, including
 /// the unscoped fallback used when the endpoint ports are unknown.
-fn build_sandbox_profile(launch: &LaunchSpec, mode: VzStructuralMode) -> String {
+fn build_sandbox_profile(
+    launch: &LaunchSpec,
+    mode: VzStructuralMode,
+    socket_dir: &VzSocketDir,
+) -> String {
     let home = launch
         .env
         .get("HOME")
@@ -1410,6 +1475,18 @@ fn build_sandbox_profile(launch: &LaunchSpec, mode: VzStructuralMode) -> String 
              (deny network-outbound)\n",
         );
         profile.push_str(&loopback_allow_rules(launch));
+        // Never broaden to a shared pattern like `/private/tmp/*.sock`: that
+        // reaches sockets of VMs started outside Firma, whose host-side
+        // listeners forward traffic around the proxy. The two write denies stop
+        // the workload from renaming such a socket, or a directory holding
+        // one, into the allowed dir.
+        let escaped = escape_sandbox_path(&socket_dir.path().display().to_string());
+        let _ = writeln!(
+            profile,
+            "(allow network-outbound (remote unix-socket (subpath \"{escaped}\")))\n\
+             (deny file-write-unlink (require-all (vnode-type SOCKET) (require-not (subpath \"{escaped}\"))))\n\
+             (deny file-write-create (require-all (subpath \"{escaped}\") (require-not (vnode-type SOCKET))))"
+        );
     }
 
     // Sensitive home path masking for claude-code profile.
@@ -1550,6 +1627,12 @@ mod tests {
             config_file: None,
             host_connection_dir: None,
             trust_anchor: None,
+        }
+    }
+
+    fn test_socket_dir() -> VzSocketDir {
+        VzSocketDir {
+            path: PathBuf::from("/private/tmp/firma-sbx_test"),
         }
     }
 
@@ -2201,7 +2284,8 @@ mod tests {
     #[test]
     fn compatibility_mode_allows_default_no_network_deny() {
         let launch = test_launch("generic");
-        let profile = build_sandbox_profile(&launch, VzStructuralMode::Compatibility);
+        let profile =
+            build_sandbox_profile(&launch, VzStructuralMode::Compatibility, &test_socket_dir());
         assert!(profile.contains("(allow default)"));
         assert!(
             !profile.contains("deny network-outbound"),
@@ -2212,7 +2296,8 @@ mod tests {
     #[test]
     fn claude_profile_denies_sensitive_home_paths_in_compatibility_mode() {
         let launch = test_launch("claude-code");
-        let profile = build_sandbox_profile(&launch, VzStructuralMode::Compatibility);
+        let profile =
+            build_sandbox_profile(&launch, VzStructuralMode::Compatibility, &test_socket_dir());
         assert!(profile.contains("deny file-read* (subpath \"/Users/tester/.ssh\")"));
         assert!(profile.contains("deny file-write* (subpath \"/Users/tester/.config\")"));
     }
@@ -2242,7 +2327,11 @@ mod tests {
     #[test]
     fn structural_mode_adds_network_deny_rule() {
         let launch = test_launch("generic");
-        let profile = build_sandbox_profile(&launch, VzStructuralMode::SandboxExecNetworkDeny);
+        let profile = build_sandbox_profile(
+            &launch,
+            VzStructuralMode::SandboxExecNetworkDeny,
+            &test_socket_dir(),
+        );
         assert!(
             profile.contains("(deny network-outbound)"),
             "structural mode must deny outbound network: {profile}"
@@ -2254,7 +2343,11 @@ mod tests {
         // `generic` launch has no HTTP_PROXY / FIRMA_DNS_STUB_ADDR, so the
         // builder cannot scope ports and falls back to allowing all loopback.
         let launch = test_launch("generic");
-        let profile = build_sandbox_profile(&launch, VzStructuralMode::SandboxExecNetworkDeny);
+        let profile = build_sandbox_profile(
+            &launch,
+            VzStructuralMode::SandboxExecNetworkDeny,
+            &test_socket_dir(),
+        );
         assert!(
             profile.contains("(allow network-outbound (remote ip4 \"localhost:*\"))"),
             "fallback must allow IPv4 localhost loopback: {profile}"
@@ -2280,7 +2373,11 @@ mod tests {
             "FIRMA_DNS_STUB_ADDR".to_string(),
             "127.0.0.1:5353".to_string(),
         );
-        let profile = build_sandbox_profile(&launch, VzStructuralMode::SandboxExecNetworkDeny);
+        let profile = build_sandbox_profile(
+            &launch,
+            VzStructuralMode::SandboxExecNetworkDeny,
+            &test_socket_dir(),
+        );
 
         assert!(profile.contains("(deny network-outbound)"), "{profile}");
         assert!(
@@ -2324,9 +2421,176 @@ mod tests {
     }
 
     #[test]
+    fn structural_mode_allows_unix_connects_only_into_the_socket_dir() {
+        let launch = test_launch("generic");
+        let profile = build_sandbox_profile(
+            &launch,
+            VzStructuralMode::SandboxExecNetworkDeny,
+            &test_socket_dir(),
+        );
+
+        assert!(
+            profile.contains(
+                "(allow network-outbound (remote unix-socket (subpath \"/private/tmp/firma-sbx_test\")))"
+            ),
+            "the run's socket dir must be allow-listed: {profile}"
+        );
+        assert_eq!(
+            profile.matches("unix-socket").count(),
+            1,
+            "no other unix-socket allowance may appear: {profile}"
+        );
+        assert!(
+            profile.contains(
+                "(deny file-write-unlink (require-all (vnode-type SOCKET) (require-not (subpath \"/private/tmp/firma-sbx_test\"))))"
+            ),
+            "sockets outside the dir must not be movable into it: {profile}"
+        );
+    }
+
+    #[test]
+    fn compatibility_mode_adds_no_unix_socket_rule() {
+        let launch = test_launch("generic");
+        let profile =
+            build_sandbox_profile(&launch, VzStructuralMode::Compatibility, &test_socket_dir());
+
+        assert!(!profile.contains("unix-socket"), "{profile}");
+        assert!(!profile.contains("vnode-type SOCKET"), "{profile}");
+    }
+
+    #[test]
+    fn socket_dir_leaves_room_for_long_socket_names() {
+        // macOS `sun_path` is 104 bytes including the NUL.
+        const LONGEST_KNOWN_SOCKET_NAME: &str = "gondolin-virtio-ingress-00000000.sock";
+        let socket_dir = VzSocketDir::for_sandbox(&SandboxId::generate());
+        let socket = socket_dir.path().join(LONGEST_KNOWN_SOCKET_NAME);
+
+        assert!(
+            socket.as_os_str().len() < 104,
+            "{} overruns sun_path",
+            socket.display()
+        );
+    }
+
+    #[test]
+    fn socket_dir_create_refuses_an_existing_entry() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket_dir = VzSocketDir::in_dir(root.path(), &SandboxId::generate());
+        std::fs::create_dir(socket_dir.path()).expect("plant dir");
+
+        let error = socket_dir.create().expect_err("pre-existing dir");
+
+        assert!(
+            error.to_string().contains("created by another process"),
+            "error must name the fix: {error}"
+        );
+    }
+
+    #[test]
+    fn socket_dir_remove_deletes_the_directory_and_its_sockets() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket_dir = VzSocketDir::in_dir(root.path(), &SandboxId::generate());
+        socket_dir.create().expect("create socket dir");
+        std::fs::write(socket_dir.path().join("stale.sock"), b"").expect("stale entry");
+
+        socket_dir.remove();
+
+        assert!(!socket_dir.path().exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct UnixConnectProbe {
+        inside: camino::Utf8PathBuf,
+        outside: camino::Utf8PathBuf,
+        outside_parent: camino::Utf8PathBuf,
+    }
+
+    firma_test_helpers::process_fixture! {
+        #[cfg(target_os = "macos")]
+        fn unix_connect_probe(probe: UnixConnectProbe) {
+            std::os::unix::net::UnixStream::connect(&probe.inside)
+                .expect("connect inside the run's socket dir");
+            let error = std::os::unix::net::UnixStream::connect(&probe.outside)
+                .expect_err("connect outside the run's socket dir");
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+            let socket_dir = probe.inside.parent().expect("socket dir");
+            for (from, to) in [
+                (&probe.outside, socket_dir.join("moved.sock")),
+                (&probe.outside_parent, socket_dir.join("moved")),
+            ] {
+                let error = std::fs::rename(from, &to).expect_err("rename into the socket dir");
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied, "{from}");
+            }
+            let error = std::fs::hard_link(&probe.outside, socket_dir.join("linked.sock"))
+                .expect_err("hard link into the socket dir");
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn network_deny_profile_limits_unix_connects_to_the_socket_dir() {
+        let nests = Command::new("sandbox-exec")
+            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !nests {
+            eprintln!("skipped: already inside a Seatbelt sandbox, and sandbox-exec does not nest");
+            return;
+        }
+        // `$TMPDIR` paths overrun `sun_path`.
+        let root = tempfile::tempdir_in(VZ_SOCKET_DIR_PARENT).expect("tempdir");
+        let socket_dir = VzSocketDir::in_dir(root.path(), &SandboxId::generate());
+        socket_dir.create().expect("create socket dir");
+        let outside_dir = root.path().join("outside");
+        std::fs::create_dir(&outside_dir).expect("outside dir");
+        let inside = socket_dir.path().join("vm.sock");
+        let outside = outside_dir.join("vm.sock");
+        let _inside_listener =
+            std::os::unix::net::UnixListener::bind(&inside).expect("bind inside");
+        let _outside_listener =
+            std::os::unix::net::UnixListener::bind(&outside).expect("bind outside");
+        let profile = build_sandbox_profile(
+            &test_launch("generic"),
+            VzStructuralMode::SandboxExecNetworkDeny,
+            &socket_dir,
+        );
+
+        let utf8 = |path: PathBuf| camino::Utf8PathBuf::from_path_buf(path).expect("UTF-8 path");
+        let fixture = unix_connect_probe(UnixConnectProbe {
+            inside: utf8(inside),
+            outside: utf8(outside),
+            outside_parent: utf8(outside_dir),
+        });
+        let status = Command::new("sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg(fixture.get_program())
+            .args(fixture.get_args())
+            .envs(
+                fixture
+                    .get_envs()
+                    .filter_map(|(key, value)| value.map(|value| (key, value))),
+            )
+            .status()
+            .expect("spawn sandbox-exec");
+
+        assert!(
+            status.success(),
+            "probe failed under the profile: {profile}"
+        );
+    }
+
+    #[test]
     fn structural_deny_appears_after_allow_default() {
         let launch = test_launch("generic");
-        let profile = build_sandbox_profile(&launch, VzStructuralMode::SandboxExecNetworkDeny);
+        let profile = build_sandbox_profile(
+            &launch,
+            VzStructuralMode::SandboxExecNetworkDeny,
+            &test_socket_dir(),
+        );
         let allow_pos = profile.find("(allow default)").expect("allow default");
         let deny_pos = profile
             .find("(deny network-outbound)")
@@ -2340,7 +2604,11 @@ mod tests {
     #[test]
     fn structural_mode_with_claude_profile_combines_both_rules() {
         let launch = test_launch("claude-code");
-        let profile = build_sandbox_profile(&launch, VzStructuralMode::SandboxExecNetworkDeny);
+        let profile = build_sandbox_profile(
+            &launch,
+            VzStructuralMode::SandboxExecNetworkDeny,
+            &test_socket_dir(),
+        );
         assert!(
             profile.contains("(deny network-outbound)"),
             "needs network deny"

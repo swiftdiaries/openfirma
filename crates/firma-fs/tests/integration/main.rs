@@ -119,6 +119,69 @@ fn create_private_dir_all_returns_create_error_for_existing_file() -> io::Result
 }
 
 #[test]
+fn create_new_private_dir_creates_private_directory() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("sockets");
+
+    firma_fs::create_new_private_dir(&path).expect("create dir");
+
+    assert!(path.is_dir());
+    #[cfg(unix)]
+    {
+        let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+    Ok(())
+}
+
+#[test]
+fn create_new_private_dir_refuses_existing_directory() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("sockets");
+    std::fs::create_dir(&path)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+
+    let error = firma_fs::create_new_private_dir(&path).expect_err("existing dir");
+
+    let rendered = normalize_error_path(&error.to_string(), &path);
+    insta::assert_snapshot!(rendered, @"failed to create <path>: <os_error>");
+    #[cfg(unix)]
+    {
+        let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "a refused directory keeps its original mode");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn create_new_private_dir_refuses_symlink() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let target = dir.path().join("elsewhere");
+    std::fs::create_dir(&target)?;
+    let path = dir.path().join("sockets");
+    std::os::unix::fs::symlink(&target, &path)?;
+
+    let error = firma_fs::create_new_private_dir(&path).expect_err("symlink");
+
+    let rendered = normalize_error_path(&error.to_string(), &path);
+    insta::assert_snapshot!(rendered, @"failed to create <path>: <os_error>");
+    Ok(())
+}
+
+#[test]
+fn create_new_private_dir_requires_parent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("missing").join("sockets");
+
+    let error = firma_fs::create_new_private_dir(&path).expect_err("missing parent");
+
+    let rendered = normalize_error_path(&error.to_string(), &path);
+    insta::assert_snapshot!(rendered, @"failed to create <path>: <os_error>");
+}
+
+#[test]
 fn write_file_creates_or_truncates_with_requested_mode() -> io::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("config.toml");
